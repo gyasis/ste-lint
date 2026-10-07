@@ -1,0 +1,1087 @@
+#!/usr/bin/env python3
+"""ste-lint — ASD-STE100-inspired slop linter for technical prose. Stdlib only.
+
+Checks markdown/plain-text prose against a Simplified-Technical-English-style
+rule set: sentence length, a ~200-entry deny list (inflated verbs, hedges,
+marketing adjectives, AI tells, nominalizations, phrasal verbs), passive voice,
+punctuation symptoms, and synonym rotation. Skips code blocks, inline code,
+YAML front-matter, URLs, link targets, HTML tags, and table delimiter rows.
+
+Scoring: the primary metric is VIOLATIONS PER 100 VERBS (matches the published
+research: baseline 4.36 -> STE 1.12). Verb counting has no POS tagger; the
+heuristic is documented at count_verbs() and is honest about being ±15%.
+A second metric, violations per 100 words, is stable and heuristic-free.
+
+Exit codes: 0 ok · 1 --max-score gate exceeded · 2 usage/IO error.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+
+CATEGORIES = ("sentence-length", "deny-list", "passive-voice",
+              "punctuation", "synonym-rotation")
+
+# ---------------------------------------------------------------------------
+# Imperative starter verbs — a sentence beginning with one of these (or a list
+# item beginning with any known verb) is treated as an INSTRUCTION (max 20
+# words); everything else is DESCRIPTIVE (max 25 words).
+# ---------------------------------------------------------------------------
+IMPERATIVE_STARTERS = {
+    "run", "set", "open", "remove", "install", "add", "check", "verify",
+    "click", "type", "press", "restart", "delete", "create", "use", "see",
+    "note", "ensure", "configure", "enable", "disable",
+}
+
+# ---------------------------------------------------------------------------
+# DENY LIST — bad word/phrase -> replacement. Grouped by family; edit freely.
+# Entries listed in VERB_ENTRIES (below) also match common inflections
+# (leverages, leveraged, leveraging). Hyphens in keys also match spaces.
+# "(delete)" means: remove it, the sentence works without it.
+# ---------------------------------------------------------------------------
+
+# -- Latinate / inflated verbs and formal padding --------------------------
+DENY_LATINATE = {
+    "commence": "start", "utilize": "use", "leverage": "use",
+    "facilitate": "help", "initiate": "start", "terminate": "stop",
+    "endeavor": "try", "ascertain": "find", "demonstrate": "show",
+    "implement": "build", "perform": "do", "obtain": "get",
+    "require": "need", "provide": "give", "additional": "more",
+    "sufficient": "enough", "prior to": "before", "subsequent to": "after",
+    "in order to": "to", "due to the fact that": "because",
+    "at this point in time": "now", "in the event that": "if",
+    "with regard to": "about", "with respect to": "about",
+    "for the purpose of": "to", "a number of": "some",
+    "a majority of": "most", "in close proximity to": "near",
+    "approximately": "about", "assist": "help", "attempt": "try",
+    "purchase": "buy", "transmit": "send", "indicate": "show",
+    "modify": "change", "numerous": "many", "optimal": "best",
+    "possess": "have", "regarding": "about", "request": "ask",
+    "accomplish": "do", "acquire": "get", "concerning": "about",
+    "consequently": "so", "furthermore": "also", "moreover": "also",
+    "nevertheless": "but", "notwithstanding": "despite",
+    "in addition to": "besides", "in conjunction with": "with",
+    "on a daily basis": "daily", "at the present time": "now",
+    "in the near future": "soon", "until such time as": "until",
+    "whether or not": "whether", "employ": "use", "enumerate": "list",
+    "finalize": "finish", "prioritize": "rank", "methodology": "method",
+    "functionality": "function", "in terms of": "(delete)",
+    "as a means of": "to", "is able to": "can", "has the ability to": "can",
+    "aforementioned": "this", "commencement": "start",
+}
+
+# -- Hedges — qualifiers that add words, not information -------------------
+DENY_HEDGES = {
+    "it is important to note that": "(delete)",
+    "it is worth noting that": "(delete)",
+    "it should be noted": "(delete)",
+    "arguably": "(delete)", "potentially": "(delete)",
+    "essentially": "(delete)", "basically": "(delete)",
+    "fundamentally": "(delete)", "relatively": "(delete)",
+    "somewhat": "(delete)", "fairly": "(delete)", "quite": "(delete)",
+    "rather": "(delete)", "generally speaking": "(delete)",
+    "in some sense": "(delete)", "tends to": "(delete)",
+    "tend to": "(delete)", "may potentially": "may",
+    "might possibly": "might", "it seems that": "(delete)",
+    "appears to be": "is", "seems to be": "is",
+    "to some extent": "(delete)", "more or less": "(delete)",
+    "kind of": "(delete)", "sort of": "(delete)",
+    "for the most part": "mostly", "needless to say": "(delete)",
+    "as you may know": "(delete)",
+}
+
+# -- Marketing adjectives — claim quality by showing a fact instead --------
+_MK = "(show a fact instead)"
+DENY_MARKETING = {
+    "robust": _MK, "powerful": _MK, "seamless": _MK, "seamlessly": _MK,
+    "cutting-edge": _MK, "state-of-the-art": _MK, "best-in-class": _MK,
+    "world-class": _MK, "industry-leading": _MK, "revolutionary": _MK,
+    "innovative": _MK, "game-changing": _MK, "comprehensive": _MK,
+    "holistic": _MK, "elegant": _MK, "blazing-fast": _MK,
+    "blazingly fast": _MK, "lightning-fast": _MK, "rich": _MK,
+    "intuitive": _MK, "effortless": _MK, "effortlessly": _MK,
+    "frictionless": _MK, "turnkey": _MK, "next-generation": _MK,
+    "enterprise-grade": _MK, "battle-tested": _MK, "feature-rich": _MK,
+    "easy-to-use": _MK, "user-friendly": _MK, "performant": "fast",
+}
+
+# -- AI tells — the words a model reaches for when it has nothing to say ---
+DENY_AI_TELLS = {
+    "delve": "examine", "tapestry": "(delete)", "realm": "area",
+    "landscape": "area", "navigate the": "work with the",
+    "embark": "start", "unlock": "enable", "unleash": "use",
+    "harness the power": "use",
+    "dive into": "examine", "deep dive": "detailed review",
+    "at its core": "(delete)", "the world of": "(delete)",
+    "in today's": "(delete)", "ever-evolving": "(delete)",
+    "testament to": "(delete)", "plethora": "many", "myriad": "many",
+    "crucial": "important", "pivotal": "important", "vital": "needed",
+    "paramount": "most important", "meticulous": "careful",
+    "meticulously": "carefully", "showcase": "show",
+    "underscore": "show", "foster": "help", "spearhead": "lead",
+    "elevate": "improve", "streamline": "simplify", "empower": "let",
+    "resonate": "(delete)", "synergy": "(delete)", "journey": "process",
+    "game changer": "(delete)", "in conclusion": "(delete)",
+    "it's worth mentioning": "(delete)",
+}
+
+# -- Nominalizations — a verb frozen into a noun; use the verb -------------
+DENY_NOMINALIZATIONS = {
+    "perform an analysis of": "analyze", "make a decision": "decide",
+    "provide an explanation": "explain", "conduct a review": "review",
+    "carry out a test": "test", "do a comparison": "compare",
+    "give consideration to": "consider", "make an attempt": "try",
+    "take into account": "consider", "take into consideration": "consider",
+    "implementation of": "(use the verb)", "utilization of": "use",
+    "verification of": "verify", "optimization of": "optimize",
+    "make use of": "use", "make a recommendation": "recommend",
+    "perform an evaluation": "evaluate",
+    "conduct an investigation": "investigate",
+    "reach a conclusion": "conclude", "come to a decision": "decide",
+}
+
+# -- Phrasal verbs — one precise verb instead of verb + particle -----------
+DENY_PHRASAL = {
+    "spin up": "start", "reach out": "contact", "look up": "find",
+    "put off": "delay", "take off": "remove", "set up": "configure",
+    "shut down": "stop", "back up": "save", "kick off": "start",
+    "roll out": "release", "figure out": "determine",
+    "come up with": "create", "carry out": "do", "get rid of": "remove",
+    "tear down": "remove", "hook up": "connect", "fire up": "start",
+    "boot up": "start", "sort out": "resolve", "find out": "learn",
+    "point out": "show", "wrap up": "finish", "start off": "start",
+}
+
+DENY = {}
+for _fam in (DENY_LATINATE, DENY_HEDGES, DENY_MARKETING, DENY_AI_TELLS,
+             DENY_NOMINALIZATIONS, DENY_PHRASAL):
+    DENY.update(_fam)
+
+# Entries whose (first) word is a verb — matched with common inflections.
+VERB_ENTRIES = {
+    "commence", "utilize", "leverage", "facilitate", "initiate", "terminate",
+    "endeavor", "ascertain", "demonstrate", "implement", "perform", "obtain",
+    "require", "provide", "assist", "attempt", "purchase", "transmit",
+    "indicate", "modify", "possess", "request", "accomplish", "acquire",
+    "employ", "enumerate", "finalize", "prioritize", "delve", "embark",
+    "unlock", "unleash", "showcase", "underscore", "foster",
+    "spearhead", "elevate", "streamline", "empower", "resonate",
+    # phrasal firsts
+    "spin up", "reach out", "look up", "put off", "take off", "set up",
+    "shut down", "back up", "kick off", "roll out", "figure out",
+    "come up with", "carry out", "get rid of", "tear down", "hook up",
+    "fire up", "boot up", "sort out", "find out", "point out", "wrap up",
+    "start off", "dive into",
+}
+
+_IRREGULAR_INFLECTIONS = {
+    "spin": ["spun"], "come": ["came"], "take": ["took", "taken"],
+    "get": ["got", "gotten"], "tear": ["tore", "torn"],
+    "find": ["found"], "put": ["puts", "putting"],
+    "set": ["sets", "setting"], "shut": ["shuts", "shutting"],
+    "dive": ["dove"],
+}
+
+
+def _inflect_forms(w):
+    """A verb's common inflected forms (regular rules + small irregulars)."""
+    alts = {w}
+    if w.endswith("e"):
+        alts |= {w + "s", w + "d", w[:-1] + "ing"}
+    elif w.endswith("y") and len(w) > 2 and w[-2] not in "aeiou":
+        alts |= {w[:-1] + "ies", w[:-1] + "ied", w + "ing"}
+    else:
+        alts |= {w + "s", w + "ed", w + "ing"}
+    alts |= set(_IRREGULAR_INFLECTIONS.get(w, []))
+    return alts
+
+
+def _inflect_word(w):
+    """Regex alternation for a verb's common inflected forms."""
+    return "(?:" + "|".join(sorted(_inflect_forms(w), key=len,
+                                   reverse=True)) + ")"
+
+
+def _entry_body(key):
+    words = key.split(" ")
+    parts = []
+    for i, w in enumerate(words):
+        inflect = (key in VERB_ENTRIES and i == 0)
+        if inflect:
+            piece = _inflect_word(w)
+        else:
+            piece = re.escape(w).replace(r"\-", r"[-\s]")
+        parts.append(piece)
+    return r"\s+".join(parts)
+
+
+# Token-trigger dispatch: index every entry under its first word's forms so
+# the scanner does one dict lookup per token and only runs an anchored regex
+# when a token can start an entry. Longest keys registered first, so
+# "carry out a test" beats "carry out", "deep dive" beats "dive into".
+_DENY_TRIGGER = {}
+for _k in sorted(DENY, key=len, reverse=True):
+    _rx = re.compile(_entry_body(_k) + r"\b", re.IGNORECASE)
+    _first = _k.split(" ")[0]
+    _forms = _inflect_forms(_first) if _k in VERB_ENTRIES else {_first}
+    if "-" in _first:
+        _forms = set(_forms) | {_first.split("-")[0]}  # spaced variant
+    for _f in _forms:
+        _DENY_TRIGGER.setdefault(_f.lower(), []).append((_k, _rx))
+
+# ---------------------------------------------------------------------------
+# Passive voice
+# ---------------------------------------------------------------------------
+IRREGULAR_PARTICIPLES = {
+    "done", "made", "given", "taken", "seen", "known", "shown", "written",
+    "built", "sent", "held", "found", "kept", "left", "run", "set", "put",
+    "read", "told", "brought",
+}
+PASSIVE_RE = re.compile(
+    r"\b(is|are|was|were|be|been|being|am)\s+(?:(\w+ly)\s+)?([A-Za-z]+)\b",
+    re.IGNORECASE)
+
+# ---------------------------------------------------------------------------
+# Synonym clusters — 2+ members of one cluster in the same section = flag.
+# ---------------------------------------------------------------------------
+SYNONYM_CLUSTERS = {
+    "user": ["user", "customer", "client", "end-user"],
+    "method": ["method", "approach", "technique", "way"],
+    "issue": ["issue", "problem", "bug", "defect"],
+    "check": ["check", "verify", "validate", "confirm"],
+    "start": ["start", "begin", "launch", "initiate"],
+    "delete": ["delete", "remove", "erase", "purge"],
+    "config": ["config", "configuration", "settings", "setup"],
+    # "dir" dropped: it collides with CLI args and identifiers (--home-dir,
+    # XDG_*_DIR) far more often than it is a real rotation.
+    "directory": ["directory", "folder"],
+    "script": ["script", "tool", "utility", "program"],
+    "error": ["error", "failure", "fault"],
+    "parameter": ["parameter", "argument", "option", "flag"],
+    "display": ["display", "show", "render"],
+    "select": ["select", "choose", "pick"],
+    "stop": ["stop", "halt", "abort", "terminate"],
+    # "server" dropped: in infra prose it names a DAEMON (sshd, a web server),
+    # not the computer, so pairing it with box/host is a false rotation.
+    "machine": ["machine", "host", "box"],
+}
+# Token lookup: lowercase form (singular + plural) -> (cluster, member).
+_SYN_TOKEN = {}
+for _cn, _members in SYNONYM_CLUSTERS.items():
+    for _m in _members:
+        for _f in (_m, _m + "s"):
+            _SYN_TOKEN[_f.lower()] = (_cn, _m)
+
+# ---------------------------------------------------------------------------
+# Verb lexicon (~300 base forms) for the verbs-per-100 denominator.
+# ---------------------------------------------------------------------------
+VERB_LEXICON = set("""
+accept access add adjust agree allow analyze answer appear apply approve
+argue arrange arrive ask assign assume attach avoid base be become begin
+believe belong bind block break bring browse build burn buy cache calculate
+call cancel carry catch cause change charge check choose clean clear click
+clone close collect combine come comment commit compare compile complete
+compress compute configure connect consider consist contain continue convert
+copy count cover crash create cut deal debug decide declare decode decrease
+define delete deliver deny depend deploy describe design destroy detect
+determine develop diff direct disable discard discover discuss display do
+document download drag draw drop dump edit emit enable encode encrypt end
+enter escape evaluate examine exceed exclude execute exist exit expand expect
+expire explain export expose extend extract fail fall fetch fill filter find
+finish fix flag flush focus follow force forget format forward free gain
+generate get give go grant grep group grow handle hang happen hash have hear
+help hide hit hold hook host identify ignore import improve include increase
+index inject insert inspect install intercept invoke isolate issue iterate
+join keep kill know label launch lead learn leave let limit link list listen
+live load lock log look loop lose maintain make manage map mark match mean
+measure meet merge migrate miss mock modify monitor mount move name navigate
+need nest normalize notify observe occur offer omit open operate order
+output override overwrite own pack parse pass paste patch pause pay persist
+pick pin ping pipe place plan play point poll populate post prefer prepare
+prevent print process produce prompt propagate protect prove publish pull
+push put query queue quit raise reach read rebase reboot rebuild receive
+recommend record recover redirect reduce refactor refer refresh register
+reject relate release reload rely remain remember rename render repeat
+replace reply report represent reproduce reset resize resolve respond
+restart restore result resume retain retrieve retry return revert review
+rewrite roll rotate route run save scale scan schedule scroll search see
+seed seem select sell send serialize serve set share ship show sign
+simplify skip sleep sort spawn specify spin split stage stand start stash
+state stay stop store stream strip submit subscribe succeed suggest supply
+support suppress swap switch sync take talk target tell terminate test
+think throw time toggle touch trace track transfer transform translate
+trigger trim truncate trust try tune turn type understand undo unmount
+unpack unset unsubscribe unzip update upgrade upload use validate verify
+view wait wake walk want warn watch wipe work wrap write yield zip
+""".split())
+
+SUBJECT_ISH = {
+    "i", "we", "you", "they", "he", "she", "it", "this", "that", "these",
+    "those", "who", "which", "each", "everything", "nothing", "something",
+}
+
+WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’\-]*")
+ALPHA_RE = re.compile(r"[A-Za-z][A-Za-z'’\-]*")
+
+# ---------------------------------------------------------------------------
+# Source-code comment extraction — .py .ts .js .go .sql .sh .rb .rs etc.
+# Blanks code lines; preserves comment / docstring prose at original columns
+# so violation line+col numbers still point at the right place in the file.
+# ---------------------------------------------------------------------------
+SOURCE_EXTS = {
+    '.py':    {'line': ['#'],  'block': None,            'doc': ['"""', "'''"]},
+    '.pyi':   {'line': ['#'],  'block': None,            'doc': ['"""', "'''"]},
+    '.js':    {'line': ['//'], 'block': ('/*',   '*/'),  'doc': None},
+    '.jsx':   {'line': ['//'], 'block': ('/*',   '*/'),  'doc': None},
+    '.ts':    {'line': ['//'], 'block': ('/*',   '*/'),  'doc': None},
+    '.tsx':   {'line': ['//'], 'block': ('/*',   '*/'),  'doc': None},
+    '.svelte':{'line': ['//'], 'block': ('/*',   '*/'),  'doc': None},
+    '.go':    {'line': ['//'], 'block': ('/*',   '*/'),  'doc': None},
+    '.rs':    {'line': ['//'], 'block': ('/*',   '*/'),  'doc': None},
+    '.java':  {'line': ['//'], 'block': ('/*',   '*/'),  'doc': None},
+    '.c':     {'line': ['//'], 'block': ('/*',   '*/'),  'doc': None},
+    '.cpp':   {'line': ['//'], 'block': ('/*',   '*/'),  'doc': None},
+    '.h':     {'line': ['//'], 'block': ('/*',   '*/'),  'doc': None},
+    '.sh':    {'line': ['#'],  'block': None,            'doc': None},
+    '.bash':  {'line': ['#'],  'block': None,            'doc': None},
+    '.rb':    {'line': ['#'],  'block': None,            'doc': None},
+    '.sql':   {'line': ['--'], 'block': ('/*',   '*/'),  'doc': None},
+    '.lua':   {'line': ['--'], 'block': ('--[[', ']]'),  'doc': None},
+    '.css':   {'line': [],     'block': ('/*',   '*/'),  'doc': None},
+    '.yaml':  {'line': ['#'],  'block': None,            'doc': None},
+    '.yml':   {'line': ['#'],  'block': None,            'doc': None},
+    '.toml':  {'line': ['#'],  'block': None,            'doc': None},
+    '.r':     {'line': ['#'],  'block': None,            'doc': None},
+}
+
+
+def _find_comment_start(line, prefix):
+    """Index of first `prefix` not preceded by `:` (skips `://` URLs). -1 if absent."""
+    start = 0
+    plen = len(prefix)
+    while True:
+        idx = line.find(prefix, start)
+        if idx < 0:
+            return -1
+        if idx == 0 or line[idx - 1] != ':':
+            return idx
+        start = idx + plen
+
+
+def extract_source_prose(lines, ext):
+    """Return lines with code blanked and comment/docstring prose preserved.
+
+    Code characters are replaced with spaces so column numbers stay valid.
+    Unknown or plain-text extensions return the original lines unchanged.
+    """
+    style = SOURCE_EXTS.get(ext.lower() if ext else '')
+    if style is None:
+        return lines
+
+    line_prefixes = style['line']
+    block_pair    = style.get('block')     # (open_tok, close_tok) or None
+    doc_markers   = style.get('doc') or []
+
+    out = []
+    in_block = False
+    in_doc   = False
+    doc_marker = None
+
+    for raw in lines:
+        nl   = '\n' if isinstance(raw, str) and raw.endswith('\n') else ''
+        line = raw.rstrip('\n') if isinstance(raw, str) else raw
+
+        # ── inside a multi-line block comment ──────────────────────────────
+        if in_block:
+            close = block_pair[1]
+            idx = line.find(close)
+            # strip decorative leading * common in /** … */ JavaDoc blocks
+            _strip_star = lambda s: re.sub(
+                r'^ {0,3}\*+\s?', lambda m: ' ' * len(m.group()), s)
+            if idx >= 0:
+                prose = _strip_star(line[:idx])
+                out.append((prose if prose.strip() else ' ' * len(line)) + nl)
+                in_block = False
+            else:
+                prose = _strip_star(line)
+                out.append((prose if prose.strip() else ' ' * len(line)) + nl)
+            continue
+
+        # ── inside a multi-line docstring ──────────────────────────────────
+        if in_doc:
+            idx = line.find(doc_marker)
+            if idx >= 0:
+                out.append(line[:idx] + ' ' * (len(line) - idx) + nl)
+                in_doc = False
+            else:
+                out.append(line + nl)
+            continue
+
+        # ── docstring open (Python triple-quoted strings) ───────────────────
+        handled = False
+        for dm in doc_markers:
+            idx = line.find(dm)
+            if idx < 0:
+                continue
+            close_idx = line.find(dm, idx + len(dm))
+            if close_idx >= 0:
+                # single-line: """prose"""
+                prose = line[idx + len(dm):close_idx]
+                out.append(' ' * (idx + len(dm)) + prose
+                           + ' ' * (len(line) - close_idx - len(dm)) + nl)
+            else:
+                out.append(' ' * (idx + len(dm)) + line[idx + len(dm):] + nl)
+                in_doc = True
+                doc_marker = dm
+            handled = True
+            break
+        if handled:
+            continue
+
+        # ── block comment open ──────────────────────────────────────────────
+        if block_pair:
+            open_tok, close_tok = block_pair
+            idx = (_find_comment_start(line, open_tok)
+                   if open_tok.startswith('/') else line.find(open_tok))
+            if idx >= 0:
+                close_idx = line.find(close_tok, idx + len(open_tok))
+                if close_idx >= 0:
+                    prose = line[idx + len(open_tok):close_idx]
+                    out.append(' ' * (idx + len(open_tok)) + prose
+                               + ' ' * (len(line) - close_idx - len(close_tok)) + nl)
+                else:
+                    rest = line[idx + len(open_tok):]
+                    # blank opening lines like /** or /* with no real text after
+                    if not re.search(r'[A-Za-z0-9]', rest):
+                        out.append(' ' * len(line) + nl)
+                    else:
+                        out.append(' ' * (idx + len(open_tok)) + rest + nl)
+                    in_block = True
+                continue
+
+        # ── single-line comment ─────────────────────────────────────────────
+        found = False
+        for prefix in line_prefixes:
+            idx = _find_comment_start(line, prefix)
+            if idx < 0:
+                continue
+            after = line[idx + len(prefix):]
+            if after.startswith('!'):    # shebang (#!) — skip
+                break
+            out.append(' ' * (idx + len(prefix)) + after + nl)
+            found = True
+            break
+
+        if not found:
+            out.append(' ' * len(line) + nl)    # pure code — blank it
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Markdown masking — replace non-prose regions with spaces so column numbers
+# still refer to the original line.
+# ---------------------------------------------------------------------------
+FENCE_RE = re.compile(r"^\s*(```+|~~~+)")
+TABLE_DELIM_RE = re.compile(r"^\s*\|?\s*:?-{2,}[:\s|\-]*$")
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+URL_RE = re.compile(r"(?:https?|ftp)://\S+|\bwww\.\S+")
+LINK_TARGET_RE = re.compile(r"\]\([^)\s]*[^)]*\)")
+HTML_TAG_RE = re.compile(r"</?[A-Za-z][^>\n]*>")
+LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s")
+
+
+def _blank_span(line, start, end):
+    return line[:start] + " " * (end - start) + line[end:]
+
+
+def mask_markdown(lines):
+    """Return (masked_lines, meta) — masked lines keep original columns."""
+    masked = []
+    meta = []  # per line: {"code": bool, "heading": bool, "list": bool}
+    in_fence = False
+    fence_char = ""
+    in_yaml = False
+    prev_code_or_blank = True
+    for idx, raw in enumerate(lines):
+        line = raw.rstrip("\n")
+        info = {"code": False, "heading": False, "list": False}
+        # YAML front-matter (only at the very top of the file)
+        if idx == 0 and line.strip() == "---":
+            in_yaml = True
+            masked.append(" " * len(line)); info["code"] = True
+            meta.append(info); continue
+        if in_yaml:
+            masked.append(" " * len(line)); info["code"] = True
+            meta.append(info)
+            if line.strip() in ("---", "..."):
+                in_yaml = False
+            continue
+        # Fenced code blocks
+        fm = FENCE_RE.match(line)
+        if fm:
+            marker = fm.group(1)[0]
+            if not in_fence:
+                in_fence = True; fence_char = marker
+            elif marker == fence_char:
+                in_fence = False
+            masked.append(" " * len(line)); info["code"] = True
+            meta.append(info); prev_code_or_blank = True; continue
+        if in_fence:
+            masked.append(" " * len(line)); info["code"] = True
+            meta.append(info); continue
+        # Indented code blocks (4-space / tab, after a blank or code line)
+        if (line.startswith("    ") or line.startswith("\t")) \
+                and line.strip() and prev_code_or_blank \
+                and not LIST_ITEM_RE.match(line):
+            masked.append(" " * len(line)); info["code"] = True
+            meta.append(info); continue
+        # Table delimiter rows
+        if "|" in line and "-" in line and TABLE_DELIM_RE.match(line):
+            masked.append(" " * len(line)); info["code"] = True
+            meta.append(info); prev_code_or_blank = False; continue
+        # Inline masks
+        out = line
+        for rx in (INLINE_CODE_RE, URL_RE, LINK_TARGET_RE, HTML_TAG_RE):
+            for m in list(rx.finditer(out)):
+                out = _blank_span(out, m.start(), m.end())
+        if HEADING_RE.match(line):
+            info["heading"] = True
+            # strip the leading #'s from prose analysis but keep heading text
+            hm = re.match(r"^\s{0,3}(#{1,6})\s", out)
+            if hm:
+                out = _blank_span(out, hm.start(1), hm.end(1))
+        if LIST_ITEM_RE.match(line):
+            info["list"] = True
+            lm = LIST_ITEM_RE.match(out)
+            if lm:
+                out = _blank_span(out, 0, lm.end())
+        masked.append(out)
+        meta.append(info)
+        prev_code_or_blank = (line.strip() == "")
+    return masked, meta
+
+
+# ---------------------------------------------------------------------------
+# Blocks — contiguous prose with a char -> (line, col) map, so multi-line
+# sentences and multi-word phrases still get exact positions.
+# ---------------------------------------------------------------------------
+class Block:
+    __slots__ = ("_chars", "text", "cmap", "list_item", "first_line")
+
+    def __init__(self):
+        self._chars = []
+        self.text = ""
+        self.cmap = []          # per char: (line_idx0, col0)
+        self.list_item = False
+        self.first_line = 0
+
+    def finish(self):
+        self.text = "".join(self._chars)
+        self._chars = []
+
+
+def build_blocks(masked, meta):
+    blocks = []
+    cur = None
+    for idx, mline in enumerate(masked):
+        blank = (mline.strip() == "") or meta[idx]["code"]
+        starts_new = meta[idx]["heading"] or meta[idx]["list"]
+        if blank:
+            cur = None
+            continue
+        if cur is None or starts_new:
+            cur = Block()
+            cur.list_item = meta[idx]["list"]
+            cur.first_line = idx
+            blocks.append(cur)
+        if cur._chars:
+            cur._chars.append(" ")
+            cur.cmap.append(cur.cmap[-1])
+        cur._chars.extend(mline)
+        cur.cmap.extend((idx, col) for col in range(len(mline)))
+        if meta[idx]["heading"]:
+            cur = None  # a heading is its own block
+    for b in blocks:
+        b.finish()
+    return blocks
+
+
+# ---------------------------------------------------------------------------
+# Sentence splitting (abbreviation- and decimal-aware, no NLP deps)
+# ---------------------------------------------------------------------------
+_ABBREV = {"e.g", "i.e", "etc", "vs", "cf", "approx", "fig", "no", "dr",
+           "mr", "mrs", "ms", "inc", "st", "min", "max", "sec"}
+
+
+def split_sentences(text):
+    sents = []
+    start = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in ".!?":
+            j = i
+            while i + 1 < n and text[i + 1] in ".!?":
+                i += 1
+            tok_m = re.search(r"[A-Za-z][\w.]*$", text[max(0, j - 40):j])
+            tok = tok_m.group(0).lower().rstrip(".") if tok_m else ""
+            is_decimal = (c == "." and j > 0 and text[j - 1].isdigit()
+                          and i + 1 < n and text[i + 1].isdigit())
+            is_abbrev = c == "." and (tok in _ABBREV
+                                      or (len(tok) == 1 and tok.isalpha()))
+            if not is_decimal and not is_abbrev \
+                    and (i + 1 >= n or text[i + 1].isspace()):
+                seg = text[start:i + 1]
+                if seg.strip():
+                    sents.append((start, i + 1))
+                i += 1
+                while i < n and text[i].isspace():
+                    i += 1
+                start = i
+                continue
+        i += 1
+    if start < n and text[start:].strip():
+        sents.append((start, n))
+    return sents
+
+
+# ---------------------------------------------------------------------------
+# Verb counting — the honest heuristic (no POS tagger, stdlib only):
+#   a token counts as a verb if (a) its lowercase form is in the ~300-entry
+#   base-form lexicon, or (b) its -s/-es/-ed/-ing stem is in the lexicon, or
+#   (c) it ends in -s/-es/-ed/-ing AND directly follows a subject-ish token
+#   (pronoun/demonstrative). Nouns that collide with verb base forms inflate
+#   the count; gerunds used as nouns do too. Treat the result as ±15%.
+# ---------------------------------------------------------------------------
+def _stems(low):
+    out = set()
+    for suf in ("ing", "es", "ed", "s", "d"):
+        if low.endswith(suf) and len(low) > len(suf) + 1:
+            stem = low[:-len(suf)]
+            out.add(stem)
+            out.add(stem + "e")          # creat -> create
+            if stem.endswith("i"):
+                out.add(stem[:-1] + "y")  # tri(ed) -> try
+            if len(stem) > 2 and stem[-1] == stem[-2]:
+                out.add(stem[:-1])        # stopp -> stop
+    return out
+
+
+def count_verbs(blocks):
+    verbs = 0
+    for b in blocks:
+        prev = ""
+        for m in ALPHA_RE.finditer(b.text):
+            low = m.group(0).lower().strip("'-’")
+            if not low:
+                continue
+            if low in VERB_LEXICON:
+                verbs += 1
+            elif any(s in VERB_LEXICON for s in _stems(low)):
+                verbs += 1
+            elif prev in SUBJECT_ISH and low.endswith(("s", "ed", "ing")):
+                verbs += 1
+            prev = low
+    return verbs
+
+
+# ---------------------------------------------------------------------------
+# Glossary
+# ---------------------------------------------------------------------------
+def load_glossary(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            terms = [t.strip() for t in fh
+                     if t.strip() and not t.strip().startswith("#")]
+    except OSError as e:
+        sys.stderr.write(
+            "ste-lint: cannot read glossary %r: %s.\n"
+            "Give --glossary a readable newline-separated text file.\n"
+            % (path, e.strerror or e))
+        sys.exit(2)
+    pats = [re.compile(r"\b" + re.escape(t).replace(r"\-", r"[-\s]")
+                       + r"\b", re.IGNORECASE) for t in terms]
+    return pats
+
+
+def glossary_spans(block, glossary_pats):
+    spans = []
+    for rx in glossary_pats:
+        for m in rx.finditer(block.text):
+            spans.append((m.start(), m.end()))
+    return spans
+
+
+def _overlaps(spans, start, end):
+    return any(s < end and start < e for s, e in spans)
+
+
+# ---------------------------------------------------------------------------
+# The checks
+# ---------------------------------------------------------------------------
+def V(block, pos, category, severity, found, replace, message, lines):
+    line0, col0 = block.cmap[min(pos, len(block.cmap) - 1)]
+    return {
+        "line": line0 + 1, "col": col0 + 1, "category": category,
+        "severity": severity, "found": found, "replace": replace,
+        "message": message, "text": lines[line0].rstrip("\n"),
+    }
+
+
+def _fmt_score(v) -> str:
+    """UNDEFINED (no verb denominator) must not render as a number a reader trusts."""
+    return "UNDEFINED(0 verbs)" if v == float("inf") else "%.2f" % v
+
+
+def check_sentence_length(block, sents, lines):
+    out = []
+    for (s, e) in sents:
+        seg = block.text[s:e]
+        words = WORD_RE.findall(seg)
+        if not words:
+            continue
+        # A markdown table CONTENT row is a data record, not a sentence. Its
+        # cells are independent fields, so a word count across the whole row
+        # is meaningless. (Measured: table rows produced the top two
+        # sentence-length "violations" in macbook-pro.md.) Delimiter rows are
+        # already masked upstream; this catches the content rows. Other checks
+        # still run on cell text, because cell prose can be genuinely sloppy.
+        if seg.count("|") >= 2:
+            continue
+        first = words[0].lower()
+        is_instruction = first in IMPERATIVE_STARTERS or \
+            (block.list_item and (first in IMPERATIVE_STARTERS
+                                  or first in VERB_LEXICON))
+        limit = 20 if is_instruction else 25
+        kind = "instruction" if is_instruction else "descriptive"
+        if len(words) > limit:
+            out.append(V(block, s, "sentence-length", "error",
+                         "%d words" % len(words),
+                         "split into sentences of <= %d words" % limit,
+                         "%s sentence has %d words (max %d)"
+                         % (kind, len(words), limit), lines))
+    return out
+
+
+def check_deny_list(block, gspans, lines):
+    out = []
+    text = block.text
+    last_end = -1
+    for tm in ALPHA_RE.finditer(text):
+        if tm.start() < last_end:
+            continue  # inside an already-accepted match
+        cands = _DENY_TRIGGER.get(tm.group(0).lower())
+        if not cands:
+            continue
+        for key, rx in cands:
+            m = rx.match(text, tm.start())
+            if not m:
+                continue
+            if not _overlaps(gspans, m.start(), m.end()):
+                repl = DENY[key]
+                out.append(V(block, m.start(), "deny-list", "error",
+                             m.group(0), repl,
+                             "'%s' -> %s" % (key, repl), lines))
+            last_end = m.end()
+            break
+    return out
+
+
+def check_passive(block, lines):
+    out = []
+    for m in PASSIVE_RE.finditer(block.text):
+        word = m.group(3)
+        low = word.lower()
+        if low in IRREGULAR_PARTICIPLES or (low.endswith("ed")
+                                            and len(low) > 3):
+            out.append(V(block, m.start(), "passive-voice", "warn",
+                         m.group(0), "rewrite in active voice",
+                         "passive construction '%s'" % m.group(0), lines))
+    return out
+
+
+def check_punctuation(block, sents, lines):
+    out = []
+    for m in re.finditer("—", block.text):
+        out.append(V(block, m.start(), "punctuation", "info", "—",
+                     "use a period or a comma", "em dash", lines))
+    for m in re.finditer(";", block.text):
+        out.append(V(block, m.start(), "punctuation", "info", ";",
+                     "split into two sentences", "semicolon", lines))
+    for (s, e) in sents:
+        n_commas = block.text[s:e].count(",")
+        if n_commas >= 3:
+            out.append(V(block, s, "punctuation", "info",
+                         "%d commas" % n_commas,
+                         "split into shorter sentences",
+                         "sentence has %d commas" % n_commas, lines))
+    return out
+
+
+def check_synonym_rotation(blocks, section_of_line, glossary_pats, lines):
+    # (cluster, section) -> member -> first (pos-sorted) location
+    seen = {}
+    for b in blocks:
+        gspans = glossary_spans(b, glossary_pats) if glossary_pats else []
+        for m in ALPHA_RE.finditer(b.text):
+            hit = _SYN_TOKEN.get(m.group(0).lower())
+            if not hit or _overlaps(gspans, m.start(), m.end()):
+                continue
+            cname, member = hit
+            line0, col0 = b.cmap[m.start()]
+            sec = section_of_line[line0]
+            d = seen.setdefault((cname, sec), {})
+            loc = (line0, col0, b, m.start())
+            if member not in d or loc[:2] < d[member][:2]:
+                d[member] = loc
+    out = []
+    for (cname, sec), members in seen.items():
+        if len(members) < 2:
+            continue
+        ordered = sorted(members.items(), key=lambda kv: kv[1][:2])
+        names = ", ".join("'%s' (line %d)" % (mname, loc[0] + 1)
+                          for mname, loc in ordered)
+        _, loc = ordered[1]
+        line0, col0, b, pos = loc
+        out.append(V(b, pos, "synonym-rotation", "warn",
+                     " / ".join(m for m, _ in ordered),
+                     "pick one name per thing",
+                     "synonym rotation in one section: %s "
+                     "-- pick one and use it everywhere" % names, lines))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+def human_report(args, path_label, violations, counts, stats, punct_detail,
+                 gate_result):
+    lines = []
+    show_punct_detail = bool(args.only_set) and "punctuation" in args.only_set
+    for v in violations:
+        if v["category"] == "punctuation" and not show_punct_detail:
+            continue
+        lines.append("%s:%d:%d  %s  %s → %s"
+                     % (path_label, v["line"], v["col"], v["category"],
+                        v["found"], v["replace"]))
+    lines.append("")
+    lines.append("Summary")
+    lines.append("  words %d  sentences %d  verbs %d "
+                 "(verb count is heuristic, ±15%%)"
+                 % (stats["words"], stats["sentences"], stats["verbs"]))
+    lines.append("  score: %s violations per 100 verbs | "
+                 "%.2f per 100 words"
+                 % (_fmt_score(stats["per_verbs"]), stats["per_words"]))
+    lines.append("  " + " | ".join("%s %d" % (c, counts[c])
+                                   for c in CATEGORIES))
+    if counts["punctuation"]:
+        lines.append("  punctuation (advisory, not scored): %d em dashes, "
+                     "%d semicolons, %d comma-heavy sentences"
+                     % (punct_detail["em_dash"], punct_detail["semicolon"],
+                        punct_detail["comma_heavy"]))
+    if gate_result is not None:
+        lines.append("  gate: score %s %s max %.2f -> %s"
+                     % (_fmt_score(stats["per_verbs"]),
+                        ">" if not gate_result else "<=",
+                        args.max_score,
+                        "FAIL" if not gate_result else "pass"))
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="ste-lint",
+        description="STE-style slop linter for technical prose "
+                    "(markdown-aware, stdlib only).")
+    ap.add_argument("file", help="input file, or '-' for stdin")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable output")
+    ap.add_argument("--glossary", metavar="PATH",
+                    help="newline-separated technical terms, never flagged")
+    ap.add_argument("--max-score", type=float, default=None, metavar="N",
+                    help="exit 1 if violations per 100 verbs exceeds N")
+    ap.add_argument("--only", metavar="CATEGORIES",
+                    help="comma-separated categories to keep: %s. Use "
+                         "'sentence-length,synonym-rotation' to run only the "
+                         "checks Vale does NOT cover."
+                         % ", ".join(CATEGORIES))
+    ap.add_argument("--quiet", action="store_true",
+                    help="score only, no per-line detail")
+    ap.add_argument("--lang", metavar="EXT",
+                    help="force source language (e.g. py ts sql sh); "
+                         "auto-detected from filename otherwise. "
+                         "Pass 'md' or 'txt' to treat stdin as plain text.")
+    args = ap.parse_args(argv)
+    if args.only:
+        args.only_set = {c.strip() for c in args.only.split(",") if c.strip()}
+        bad = args.only_set - set(CATEGORIES)
+        if bad:
+            print("ste-lint: unknown category %s. Valid: %s"
+                  % (", ".join(sorted(bad)), ", ".join(CATEGORIES)), file=sys.stderr)
+            return 2
+    else:
+        args.only_set = None
+
+    if args.file == "-":
+        text = sys.stdin.read()
+        path_label = "<stdin>"
+    else:
+        try:
+            with open(args.file, "r", encoding="utf-8",
+                      errors="replace") as fh:
+                text = fh.read()
+        except OSError as e:
+            sys.stderr.write(
+                "ste-lint: cannot read %r: %s.\n"
+                "Check the path and permissions, or pass '-' to read "
+                "stdin.\n" % (args.file, e.strerror or e))
+            return 2
+        path_label = args.file
+
+    if not text.strip():
+        sys.stderr.write(
+            "ste-lint: input is empty (0 non-whitespace bytes). "
+            "Give it a file with text, or pipe text to 'ste-lint -'.\n")
+        return 2
+
+    glossary_pats = load_glossary(args.glossary) if args.glossary else []
+
+    src_lines = text.splitlines()
+
+    # Determine file extension for source-comment extraction.
+    if args.lang:
+        ext = ('.' + args.lang.lstrip('.')) if args.lang not in ('md', 'txt', 'markdown') else ''
+    elif args.file != '-':
+        ext = os.path.splitext(args.file)[1]
+    else:
+        ext = ''
+
+    # For recognised source extensions, extract comment/docstring prose into a
+    # parallel line list (code blanked, prose kept at original column positions).
+    # src_lines is kept intact for displaying the original text in violation reports.
+    if ext.lower() in SOURCE_EXTS:
+        analysis_lines = extract_source_prose(src_lines, ext)
+    else:
+        analysis_lines = src_lines
+
+    masked, meta = mask_markdown(analysis_lines)
+    blocks = build_blocks(masked, meta)
+
+    # Section map for synonym rotation: markdown headings delimit sections;
+    # if the doc has no headings at all, fall back to 20-line windows.
+    has_headings = any(m["heading"] for m in meta)
+    section_of_line = []
+    sec = 0
+    for i, m in enumerate(meta):
+        if has_headings:
+            if m["heading"]:
+                sec += 1
+            section_of_line.append(sec)
+        else:
+            section_of_line.append(i // 20)
+
+    violations = []
+    punct_detail = {"em_dash": 0, "semicolon": 0, "comma_heavy": 0}
+    total_words = 0
+    total_sentences = 0
+
+    for b in blocks:
+        gspans = glossary_spans(b, glossary_pats) if glossary_pats else []
+        sents = split_sentences(b.text)
+        total_sentences += len(sents)
+        total_words += len(WORD_RE.findall(b.text))
+        violations += check_sentence_length(b, sents, src_lines)
+        violations += check_deny_list(b, gspans, src_lines)
+        violations += check_passive(b, src_lines)
+        pv = check_punctuation(b, sents, src_lines)
+        for v in pv:
+            if v["found"] == "—":
+                punct_detail["em_dash"] += 1
+            elif v["found"] == ";":
+                punct_detail["semicolon"] += 1
+            else:
+                punct_detail["comma_heavy"] += 1
+        violations += pv
+
+    violations += check_synonym_rotation(blocks, section_of_line,
+                                         glossary_pats, src_lines)
+
+    if args.only_set:
+        violations = [v for v in violations if v["category"] in args.only_set]
+
+    violations.sort(key=lambda v: (v["line"], v["col"]))
+    counts = {c: 0 for c in CATEGORIES}
+    for v in violations:
+        counts[v["category"]] += 1
+    total = sum(counts.values())
+
+    verbs = count_verbs(blocks)
+    # Punctuation is a SYMPTOM, not the disease: em dashes and semicolons are
+    # what a banned-word list already removes without touching the slop itself.
+    # Counting them in the headline score buries the real signal (measured: 21
+    # of 28 violations on a normal rule file were punctuation). They stay in
+    # `counts` and in the report, but they do not drive the score or the gate —
+    # unless the user asked for punctuation specifically with --only.
+    scored = total if (args.only_set == {"punctuation"}) else (
+        total - counts["punctuation"])
+    # A zero verb count makes the per-verb score UNDEFINED, not zero. Returning 0.0 here
+    # reported the most favourable possible score for text the linter had just flagged, and
+    # --max-score then PASSED it: "We leverage robust seamless cutting-edge synergy." scored
+    # 0.00/100 verbs (5 violations, 83.33/100 words) and exited 0. A broken measurement must
+    # never read as a clean result, so an undefined score fails the gate instead.
+    if verbs:
+        per_verbs = scored * 100.0 / verbs
+    elif scored:
+        per_verbs = float("inf")          # violations with no denominator → never "clean"
+    else:
+        per_verbs = 0.0                   # genuinely nothing flagged
+    per_words = (scored * 100.0 / total_words) if total_words else 0.0
+    stats = {"words": total_words, "sentences": total_sentences,
+             "verbs": verbs, "per_verbs": per_verbs, "per_words": per_words}
+
+    gate_result = None
+    ok = True
+    if args.max_score is not None:
+        gate_result = per_verbs <= args.max_score
+        ok = gate_result
+
+    if args.json:
+        payload = {
+            "ok": ok,
+            "file": path_label,
+            # `Infinity` is NOT valid JSON (RFC 8259) — JS JSON.parse throws on it. An
+            # undefined per-verb score serialises as null, with an explicit flag so a
+            # consumer can tell "undefined" from "absent" and never read it as clean.
+            "score_per_100_verbs": (None if per_verbs == float("inf")
+                                    else round(per_verbs, 2)),
+            "score_per_100_verbs_undefined": per_verbs == float("inf"),
+            "score_per_100_words": round(per_words, 2),
+            "scored_violations": scored,
+            "total_violations": total,
+            "verbs": verbs, "words": total_words,
+            "sentences": total_sentences,
+            "counts": counts,
+            "violations": violations,
+        }
+        print(json.dumps(payload, indent=2))
+    elif args.quiet:
+        print("%s violations per 100 verbs | %.2f per 100 words "
+              "(%d violations, %d verbs heuristic ±15%%, %d words)"
+              % (_fmt_score(per_verbs), per_words, total, verbs, total_words))
+        if gate_result is not None:
+            print("gate: %s (max %.2f)"
+                  % ("pass" if gate_result else "FAIL", args.max_score))
+    else:
+        print(human_report(args, path_label, violations, counts, stats,
+                           punct_detail, gate_result))
+
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
