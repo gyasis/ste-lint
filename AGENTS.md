@@ -24,6 +24,7 @@ ste-lint FILE --max-score 2.0          # CI gate — exit 1 if score > 2.0
 ste-lint FILE --lang py                # force language (for stdin or odd extensions)
 ste-lint FILE --glossary terms.txt     # whitelist project-specific jargon
 ste-lint FILE --skill                  # skill-arg check (automatic for SKILL.md)
+ste-lint NEW --source OLD              # fact-coverage: fail if the rewrite lost a fact
 ste-lint -                             # read from stdin
 ```
 
@@ -68,9 +69,12 @@ for v in result["violations"]:
 # 4. Repeat until score < 2.0 or no scored violations remain
 ```
 
-Fix `skill-arg` first: it is a correctness error, not a style problem.
-It does not count in the score, but any hit fails the run.
-Then fix categories in this order: `history-comment` → `deny-list` → `sentence-length` → `passive-voice` →
+Fix `skill-arg` and `fact-coverage` first: they are correctness errors, not
+style problems. They do not count in the score, but any hit fails the run.
+When you rewrite existing text, always pass `--source` with the original.
+Keep the best-scoring pass that has no `fact-coverage` hit, and stop after 3
+passes: a later pass can score worse.
+Then fix categories in this order: `history-comment` → `deny-list` → `multi-action` → `sentence-length` → `passive-voice` →
 `synonym-rotation` → `punctuation` (advisory). Punctuation is never counted in the
 score unless you pass `--only punctuation` explicitly.
 
@@ -163,5 +167,5 @@ never flagged regardless of which rule would normally match them.
 | Code | Meaning |
 |---|---|
 | 0 | No `--max-score` set, or score ≤ threshold |
-| 1 | `--max-score` set and score exceeded, or any `skill-arg` hit |
+| 1 | `--max-score` set and score exceeded, or any `skill-arg` or `fact-coverage` hit |
 | 2 | Usage error or file not readable |

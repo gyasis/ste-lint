@@ -24,7 +24,7 @@ import sys
 
 CATEGORIES = ("sentence-length", "deny-list", "passive-voice",
               "punctuation", "synonym-rotation", "history-comment",
-              "skill-arg")
+              "skill-arg", "multi-action", "fact-coverage")
 
 # ---------------------------------------------------------------------------
 # Imperative starter verbs — a sentence beginning with one of these (or a list
@@ -57,7 +57,7 @@ DENY_LATINATE = {
     "with regard to": "about", "with respect to": "about",
     "for the purpose of": "to", "a number of": "some",
     "a majority of": "most", "in close proximity to": "near",
-    "approximately": "about", "assist": "help", "attempt": "try",
+    "assist": "help", "attempt": "try",
     "purchase": "buy", "transmit": "send", "indicate": "show",
     "modify": "change", "numerous": "many", "optimal": "best",
     "possess": "have", "regarding": "about", "request": "ask",
@@ -92,6 +92,18 @@ DENY_HEDGES = {
     "kind of": "(delete)", "sort of": "(delete)",
     "for the most part": "mostly", "needless to say": "(delete)",
     "as you may know": "(delete)",
+}
+
+# -- Chat padding — openers, praise and sign-offs that carry no content ---
+DENY_PADDING = {
+    "great question": "(delete)", "good question": "(delete)",
+    "i hope this helps": "(delete)", "hope this helps": "(delete)",
+    "let me know if": "(delete)", "feel free to": "(delete)",
+    "happy to help": "(delete)", "i'd be happy to": "(delete)",
+    "i would be happy to": "(delete)", "i hope this": "(delete)",
+    "in summary": "(delete)", "to summarize": "(delete)",
+    "to sum up": "(delete)", "as mentioned above": "(delete)",
+    "as an ai": "(delete)",
 }
 
 # -- Marketing adjectives — claim quality by showing a fact instead --------
@@ -157,7 +169,7 @@ DENY_PHRASAL = {
 }
 
 DENY = {}
-for _fam in (DENY_LATINATE, DENY_HEDGES, DENY_MARKETING, DENY_AI_TELLS,
+for _fam in (DENY_LATINATE, DENY_HEDGES, DENY_PADDING, DENY_MARKETING, DENY_AI_TELLS,
              DENY_NOMINALIZATIONS, DENY_PHRASAL):
     DENY.update(_fam)
 
@@ -317,6 +329,7 @@ think throw time toggle touch trace track transfer transform translate
 trigger trim truncate trust try tune turn type understand undo unmount
 unpack unset unsubscribe unzip update upgrade upload use validate verify
 view wait wake walk want warn watch wipe work wrap write yield zip
+remove drain rank disconnect tighten loosen lift lower press wash rinse align fasten unscrew clamp cool heat shift slide unlock
 """.split())
 
 SUBJECT_ISH = {
@@ -820,6 +833,46 @@ def check_passive(block, lines):
     return out
 
 
+# One action per sentence. A clause starts after a comma, "and", "or" or
+# "then". A clause of two or more words is an action when its first word is a
+# known verb: the base form in an instruction, or the -s form in a
+# description ("loads", "parses").
+# STE allows two actions that happen at the same time, so the check fires at
+# MULTI_ACTION_MIN actions.
+MULTI_ACTION_MIN = 3
+_CLAUSE_SPLIT_RE = re.compile(r",\s*(?:and\s+|or\s+|then\s+)?|\s+(?:and|or|then)\s+")
+
+
+def _clause_action(clause, first_clause):
+    words = [w.lower() for w in ALPHA_RE.findall(clause)]
+    if first_clause and len(words) > 1 and words[0] in SUBJECT_ISH:
+        words = words[1:]
+    if len(words) < 2:
+        return False  # a one-word clause is a list item: "a spec, prompt, query"
+    w = words[0]
+    if w in VERB_LEXICON:
+        return True
+    return w.endswith("s") and any(s in VERB_LEXICON for s in _stems(w)
+                                   if not w.endswith(("ss", "us", "is")))
+
+
+def check_multi_action(block, sents, lines):
+    out = []
+    for (s, e) in sents:
+        seg = block.text[s:e]
+        if seg.count("|") >= 2:
+            continue
+        clauses = _CLAUSE_SPLIT_RE.split(seg)
+        actions = sum(1 for i, c in enumerate(clauses)
+                      if _clause_action(c, i == 0))
+        if actions >= MULTI_ACTION_MIN:
+            out.append(V(block, s, "multi-action", "warn",
+                         "%d actions" % actions,
+                         "write one action in each sentence",
+                         "sentence has %d actions" % actions, lines))
+    return out
+
+
 def check_punctuation(block, sents, lines):
     out = []
     for m in re.finditer("—", block.text):
@@ -906,6 +959,72 @@ def check_skill_args(lines):
     return out
 
 
+# Fact coverage: a rewrite must keep every fact of its source. Style checks
+# alone reward a rewrite that says less, so --source compares the rewrite
+# with the original. The key terms are numbers, inline code, identifiers
+# (snake_case, CamelCase, paths, flags, ALL-CAPS) and negations.
+_FACT_CODE_RE = re.compile(r"`([^`\n]+)`")
+_FACT_NUM_RE = re.compile(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w])")
+_FACT_IDENT_RE = re.compile(
+    r"(?<![\w-])(?:--?[A-Za-z][\w-]*|[A-Za-z_][\w]*(?:[._/][\w]+)+"
+    r"|[a-z]+[A-Z]\w*|[A-Z][a-z]+[A-Z]\w*|[A-Z]{2,}\w*)(?![\w])")
+_NEGATION_RE = re.compile(r"\b(?:not|never|no|none|cannot|don't|doesn't|"
+                          r"isn't|aren't|won't|can't|mustn't)\b", re.I)
+
+
+def fact_terms(text):
+    """Key terms of a text -> {term: first line number (1-based)}."""
+    terms = {}
+    for n, line in enumerate(text.splitlines(), 1):
+        for rx in (_FACT_CODE_RE, _FACT_NUM_RE, _FACT_IDENT_RE):
+            for m in rx.finditer(line):
+                term = (m.group(1) if rx is _FACT_CODE_RE else m.group(0))
+                terms.setdefault(term.strip(), n)
+    terms.pop("", None)
+    return terms
+
+
+def check_fact_coverage(source_text, text, min_ratio):
+    """Violations for facts the rewrite dropped, plus a coverage summary."""
+    out = []
+    terms = fact_terms(source_text)
+    missing = []
+    for term, n in terms.items():
+        rx = re.compile(r"(?<![\w])" + re.escape(term) + r"(?![\w])")
+        if not rx.search(text):
+            missing.append(term)
+            out.append({"line": 0, "col": 0, "category": "fact-coverage",
+                        "severity": "error", "found": term,
+                        "replace": "keep it from source line %d" % n,
+                        "message": "'%s' is in the source but not in the "
+                                   "rewrite" % term, "text": ""})
+    neg_src = len(_NEGATION_RE.findall(source_text))
+    neg_out = len(_NEGATION_RE.findall(text))
+    if neg_out < neg_src:
+        out.append({"line": 0, "col": 0, "category": "fact-coverage",
+                    "severity": "error",
+                    "found": "%d of %d negations" % (neg_out, neg_src),
+                    "replace": "keep every not / never / no",
+                    "message": "the rewrite has fewer negations than the "
+                               "source", "text": ""})
+    src_words = len(WORD_RE.findall(source_text))
+    out_words = len(WORD_RE.findall(text))
+    ratio = (out_words / src_words) if src_words else 1.0
+    if min_ratio is not None and ratio < min_ratio:
+        out.append({"line": 0, "col": 0, "category": "fact-coverage",
+                    "severity": "error",
+                    "found": "length ratio %.2f" % ratio,
+                    "replace": "keep at least %.2f of the source length"
+                               % min_ratio,
+                    "message": "the rewrite has %d words, the source %d"
+                               % (out_words, src_words), "text": ""})
+    summary = {"terms": len(terms), "missing": missing,
+               "negations_source": neg_src, "negations_rewrite": neg_out,
+               "words_source": src_words, "words_rewrite": out_words,
+               "length_ratio": round(ratio, 2)}
+    return out, summary
+
+
 def check_synonym_rotation(blocks, section_of_line, glossary_pats, lines):
     # (cluster, section) -> member -> first (pos-sorted) location
     seen = {}
@@ -971,6 +1090,9 @@ def human_report(args, path_label, violations, counts, stats, punct_detail,
         lines.append("  skill-arg: %d loader substitution(s) -> FAIL "
                      "(the skill loader rewrites these; see the lines above)"
                      % counts["skill-arg"])
+    if counts["fact-coverage"]:
+        lines.append("  fact-coverage: %d fact(s) lost from --source -> FAIL"
+                     % counts["fact-coverage"])
     if gate_result is not None:
         lines.append("  gate: score %s %s max %.2f -> %s"
                      % (_fmt_score(stats["per_verbs"]),
@@ -1002,6 +1124,13 @@ def main(argv=None):
     ap.add_argument("--skill", action="store_true",
                     help="run the skill-arg check (on by default for a file "
                          "named SKILL.md; use it for stdin)")
+    ap.add_argument("--source", metavar="PATH",
+                    help="the original text this file rewrites; fail if a "
+                         "number, code term, identifier or negation of the "
+                         "source is missing from the rewrite")
+    ap.add_argument("--min-ratio", type=float, default=None, metavar="R",
+                    help="with --source: fail if the rewrite has fewer than "
+                         "R x the source's words (e.g. 0.6)")
     ap.add_argument("--lang", metavar="EXT",
                     help="force source language (e.g. py ts sql sh); "
                          "auto-detected from filename otherwise. "
@@ -1040,6 +1169,20 @@ def main(argv=None):
         return 2
 
     glossary_pats = load_glossary(args.glossary) if args.glossary else []
+
+    source_text = None
+    if args.source:
+        try:
+            with open(args.source, "r", encoding="utf-8",
+                      errors="replace") as fh:
+                source_text = fh.read()
+        except OSError as e:
+            sys.stderr.write("ste-lint: cannot read --source %r: %s.\n"
+                             % (args.source, e.strerror or e))
+            return 2
+    elif args.min_ratio is not None:
+        sys.stderr.write("ste-lint: --min-ratio needs --source.\n")
+        return 2
 
     src_lines = text.splitlines()
 
@@ -1088,6 +1231,7 @@ def main(argv=None):
         violations += check_sentence_length(b, sents, src_lines)
         violations += check_deny_list(b, gspans, src_lines)
         violations += check_passive(b, src_lines)
+        violations += check_multi_action(b, sents, src_lines)
         if ext.lower() in SOURCE_EXTS:
             violations += check_history(b, src_lines)
         pv = check_punctuation(b, sents, src_lines)
@@ -1104,6 +1248,10 @@ def main(argv=None):
                                          glossary_pats, src_lines)
     if args.skill or (args.file != "-" and is_skill_file(args.file)):
         violations += check_skill_args(src_lines)
+    coverage = None
+    if source_text is not None:
+        cv, coverage = check_fact_coverage(source_text, text, args.min_ratio)
+        violations += cv
 
     if args.only_set:
         violations = [v for v in violations if v["category"] in args.only_set]
@@ -1121,10 +1269,12 @@ def main(argv=None):
     # outnumber every other category on normal prose. They stay in
     # `counts` and in the report, but they do not drive the score or the gate —
     # unless the user asked for punctuation specifically with --only.
-    # skill-arg is a correctness error, not prose quality: it stays out of the
-    # score and fails the run on its own (exit 1), with or without --max-score.
+    # skill-arg and fact-coverage are correctness errors, not prose quality:
+    # they stay out of the score and fail the run on their own (exit 1), with
+    # or without --max-score.
     scored = total if (args.only_set == {"punctuation"}) else (
-        total - counts["punctuation"] - counts["skill-arg"])
+        total - counts["punctuation"] - counts["skill-arg"]
+        - counts["fact-coverage"])
     # A zero verb count makes the per-verb score UNDEFINED, not zero: 0.0 would be the
     # best possible score for text that was just flagged, and --max-score would pass it.
     # A broken measurement must never read as a clean result, so it fails the gate.
@@ -1143,7 +1293,7 @@ def main(argv=None):
     if args.max_score is not None:
         gate_result = per_verbs <= args.max_score
         ok = gate_result
-    if counts["skill-arg"]:
+    if counts["skill-arg"] or counts["fact-coverage"]:
         ok = False
 
     if args.json:
@@ -1164,6 +1314,8 @@ def main(argv=None):
             "counts": counts,
             "violations": violations,
         }
+        if coverage is not None:
+            payload["coverage"] = coverage
         print(json.dumps(payload, indent=2))
     elif args.quiet:
         print("%s violations per 100 verbs | %.2f per 100 words "
