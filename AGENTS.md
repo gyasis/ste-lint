@@ -8,7 +8,7 @@ LLM, no network, no install beyond copying the file.
 
 ## When to use it
 
-Run it on any human-written prose that will be read by other people: documentation,
+Run it on any human-written prose that other people read: documentation,
 docstrings, code comments, commit messages, README files, design documents, wiki
 pages, changelogs. Do not run it on generated text, template stubs, or code itself
 (identifiers, expressions, queries).
@@ -23,6 +23,7 @@ ste-lint FILE --json                   # machine-readable violations (use this)
 ste-lint FILE --max-score 2.0          # CI gate — exit 1 if score > 2.0
 ste-lint FILE --lang py                # force language (for stdin or odd extensions)
 ste-lint FILE --glossary terms.txt     # whitelist project-specific jargon
+ste-lint FILE --skill                  # skill-arg check (automatic for SKILL.md)
 ste-lint -                             # read from stdin
 ```
 
@@ -67,7 +68,9 @@ for v in result["violations"]:
 # 4. Repeat until score < 2.0 or no scored violations remain
 ```
 
-Fix categories in this order: `deny-list` → `sentence-length` → `passive-voice` →
+Fix `skill-arg` first: it is a correctness error, not a style problem.
+It does not count in the score, but any hit fails the run.
+Then fix categories in this order: `history-comment` → `deny-list` → `sentence-length` → `passive-voice` →
 `synonym-rotation` → `punctuation` (advisory). Punctuation is never counted in the
 score unless you pass `--only punctuation` explicitly.
 
@@ -160,5 +163,5 @@ never flagged regardless of which rule would normally match them.
 | Code | Meaning |
 |---|---|
 | 0 | No `--max-score` set, or score ≤ threshold |
-| 1 | `--max-score` set and score exceeded |
+| 1 | `--max-score` set and score exceeded, or any `skill-arg` hit |
 | 2 | Usage error or file not readable |
