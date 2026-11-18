@@ -17,6 +17,16 @@ no install.
 - Several actions in one sentence (`multi-action`): 3 or more clauses that
   start with a verb. Write one action in each sentence.
 - Chat padding: `Great question`, `I hope this helps`, `in summary`.
+- Telegraphic instructions (`telegraphic`): 6 or more words with no article,
+  preposition or short verb. An example is `Remove cap, check seal, replace
+  gasket if worn`. Write `Remove the cap`.
+- Safety labels (`warning-label`): `WARNING` is for a risk of injury,
+  `CAUTION` for a risk of damage, `NOTE` for information. A `WARNING` or
+  `CAUTION` starts with a command.
+- Long paragraphs (`paragraph-length`): more than 6 sentences.
+- Procedures in running text (`procedure-form`): 3 or more instructions in one
+  paragraph or in one list item. Write a numbered list with one instruction in
+  each step.
 - History in source comments (`history-comment`): dates, incidents and people.
   Put that story in the dev diary or the commit message.
 - Skill-loader substitution (`skill-arg`), only in a file named `SKILL.md` or
@@ -28,12 +38,33 @@ no install.
 ## Fact coverage (rewrites)
 
 A style score rewards a rewrite that says less. Give the original with
-`--source` and ste-lint checks that the rewrite keeps every number, inline
-code term, identifier (path, flag, `snake_case`, `CamelCase`, ALL-CAPS) and
-negation of the source. `--min-ratio R` also fails a rewrite with fewer than
-R times the source's words. Any lost fact fails the run with exit 1. The
-lost facts do not count in the score. The check does not see plain words, so
-a lost "red cable" still needs a human read.
+`--source` and ste-lint checks that the rewrite keeps these facts of the
+source:
+
+- every number, inline code term and identifier (path, flag, `snake_case`,
+  `CamelCase`, ALL-CAPS);
+- every negation (`not`, `never`, `no`);
+- every value word. A value word is a plain word that stands for a value:
+
+| Class | Words | Value |
+|---|---|---|
+| color | red, green, `#f00` | hex code |
+| polarity | positive, plus, `+`, negative, ground | sign |
+| side, vertical, depth | left, top, rear | axis value |
+| rotation, radial, compass | clockwise, inward, north | axis value |
+| state | open, closed, enabled, true, `required` | state |
+| limit | maximum, at least, below, `<=` | operator |
+| order | first, last, before, after | position |
+| quantity | `12 V`, `30 min`, `5 volts` | number and unit |
+
+ste-lint compares the words of one class by value, so `red` and `#ff0000`
+match, and `12 V` and `12 volts` match. A changed value is a swap: "the source says
+'clockwise' and the rewrite has 'counterclockwise' instead".
+
+`--min-ratio R` also fails a rewrite with fewer than R times the source's
+words. Any lost fact fails the run with exit 1. The lost facts do not count
+in the score. Other plain words, such as "terminal" or "cable", are not
+checked, so a human still reads the rewrite.
 
 ```bash
 ste-lint rewrite.md --source original.md --min-ratio 0.6

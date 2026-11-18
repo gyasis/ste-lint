@@ -74,7 +74,8 @@ style problems. They do not count in the score, but any hit fails the run.
 When you rewrite existing text, always pass `--source` with the original.
 Keep the best-scoring pass that has no `fact-coverage` hit, and stop after 3
 passes: a later pass can score worse.
-Then fix categories in this order: `history-comment` → `deny-list` → `multi-action` → `sentence-length` → `passive-voice` →
+Then fix categories in this order: `history-comment` → `warning-label` → `procedure-form` → `deny-list` → `multi-action` →
+`telegraphic` → `sentence-length` → `paragraph-length` → `passive-voice` →
 `synonym-rotation` → `punctuation` (advisory). Punctuation is never counted in the
 score unless you pass `--only punctuation` explicitly.
 

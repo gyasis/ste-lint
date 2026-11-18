@@ -24,7 +24,8 @@ import sys
 
 CATEGORIES = ("sentence-length", "deny-list", "passive-voice",
               "punctuation", "synonym-rotation", "history-comment",
-              "skill-arg", "multi-action", "fact-coverage")
+              "skill-arg", "multi-action", "fact-coverage", "telegraphic",
+              "warning-label", "paragraph-length", "procedure-form")
 
 # ---------------------------------------------------------------------------
 # Imperative starter verbs — a sentence beginning with one of these (or a list
@@ -599,7 +600,8 @@ def mask_markdown(lines, source=False):
 # sentences and multi-word phrases still get exact positions.
 # ---------------------------------------------------------------------------
 class Block:
-    __slots__ = ("_chars", "text", "cmap", "list_item", "first_line")
+    __slots__ = ("_chars", "text", "cmap", "list_item", "first_line",
+                 "heading")
 
     def __init__(self):
         self._chars = []
@@ -607,6 +609,7 @@ class Block:
         self.cmap = []          # per char: (line_idx0, col0)
         self.list_item = False
         self.first_line = 0
+        self.heading = False
 
     def finish(self):
         self.text = "".join(self._chars)
@@ -625,6 +628,7 @@ def build_blocks(masked, meta):
         if cur is None or starts_new:
             cur = Block()
             cur.list_item = meta[idx]["list"]
+            cur.heading = meta[idx]["heading"]
             cur.first_line = idx
             blocks.append(cur)
         if cur._chars:
@@ -873,6 +877,137 @@ def check_multi_action(block, sents, lines):
     return out
 
 
+# Telegraphic style: STE keeps the articles, prepositions and short verbs.
+# An instruction of TELEGRAPHIC_MIN words or more with none of them reads
+# like a note ("Remove cap, check seal, replace gasket if worn"). List items
+# and sentences with masked code are fragments by design and are skipped.
+TELEGRAPHIC_MIN = 6
+FUNCTION_WORDS = set("""
+a an the this that these those each every all both any some no one your
+their our his her my its it to of for with in on at by from into onto
+through over under between per is are was were be been am can will must
+should may do does we you they he she i
+""".split())
+
+
+def check_telegraphic(block, sents, lines):
+    out = []
+    if block.heading or block.list_item:
+        return out
+    for (s, e) in sents:
+        seg = block.text[s:e]
+        if seg.count("|") >= 2 or "   " in seg.strip():
+            continue
+        words = [w.lower() for w in ALPHA_RE.findall(seg)]
+        if len(words) >= TELEGRAPHIC_MIN and _is_instruction(seg) \
+                and not FUNCTION_WORDS & set(words):
+            out.append(V(block, s, "telegraphic", "warn",
+                         "%d words, no articles" % len(words),
+                         "add the articles and short words: 'Remove the cap'",
+                         "sentence has no articles or function words", lines))
+    return out
+
+
+# Safety labels: WARNING (or DANGER) is for a risk of injury or death,
+# CAUTION for a risk of damage to equipment or data, NOTE for information.
+# A WARNING or CAUTION starts with a command that tells the reader what to do.
+_LABEL_RE = re.compile(r"^[\s>*_\[!]*(WARNING|DANGER|CAUTION|NOTE)\b[\]*_:!.\s-]*",
+                       re.I)
+_HAZARD_RE = re.compile(
+    r"\b(?:injur\w*|death|die|kill\w*|burn\w*|shock\w*|electrocut\w*|"
+    r"fire|explo\w*|toxic|poison\w*|harm\w*|hurt|crush\w*|cut|eyes?|skin|"
+    r"fall\w*|hot|high voltage|live wire|lethal|fatal|hazard\w*|safety)\b", re.I)
+_DAMAGE_RE = re.compile(
+    r"\b(?:damag\w*|break\w*|broke\w*|corrupt\w*|lose|loss|lost|delet\w*|"
+    r"overwrit\w*|destroy\w*|wip\w*|fail\w*|crash\w*|irreversible|"
+    r"permanent\w*|cost\w*|bill\w*)\b", re.I)
+
+
+def check_warning_label(block, sents, lines):
+    out = []
+    m = _LABEL_RE.match(block.text)
+    if not m or not m.group(1).isupper():
+        return out
+    label = m.group(1).upper()
+    body = block.text[m.end():]
+    hazard = bool(_HAZARD_RE.search(body))
+    damage = bool(_DAMAGE_RE.search(body))
+    if label in ("WARNING", "DANGER") and not hazard:
+        out.append(V(block, 0, "warning-label", "warn", label,
+                     "CAUTION" if damage else "NOTE",
+                     "%s is for a risk of injury; use %s for %s" % (
+                         label, "CAUTION" if damage else "NOTE",
+                         "damage" if damage else "information"), lines))
+    elif label == "CAUTION" and hazard:
+        out.append(V(block, 0, "warning-label", "warn", label, "WARNING",
+                     "CAUTION is for damage; use WARNING for a risk of "
+                     "injury", lines))
+    if label != "NOTE":
+        first = [w.lower() for w in ALPHA_RE.findall(body)[:2]]
+        if first and not (first[0] in IMPERATIVE_STARTERS
+                          or first[0] in VERB_LEXICON
+                          or first[0] in ("never", "always", "keep")
+                          or first[:2] == ["do", "not"]):
+            out.append(V(block, m.end(), "warning-label", "warn",
+                         " ".join(first), "start with a command: 'Do not ...'",
+                         "a %s starts with what the reader must do" % label,
+                         lines))
+    return out
+
+
+# Paragraph length: STE keeps a paragraph to one topic and PARAGRAPH_MAX
+# sentences or fewer.
+PARAGRAPH_MAX = 6
+
+
+def check_paragraph_length(block, sents, lines):
+    if block.heading or block.list_item or block.text.count("|") >= 2:
+        return []
+    if len(sents) <= PARAGRAPH_MAX:
+        return []
+    return [V(block, 0, "paragraph-length", "warn",
+              "%d sentences" % len(sents),
+              "split into paragraphs of <= %d sentences" % PARAGRAPH_MAX,
+              "paragraph has %d sentences (max %d)"
+              % (len(sents), PARAGRAPH_MAX), lines)]
+
+
+# Procedure form: a procedure is a numbered list with one instruction in each
+# step. PROCEDURE_MIN instructions in one prose paragraph, or in one list
+# item, are a procedure written as running text.
+PROCEDURE_MIN = 3
+
+
+_NOT_IMPERATIVE_NEXT = {"is", "are", "was", "were", "has", "have", "had",
+                        "can", "will", "must", "should", "may", "does"}
+
+
+def _is_instruction(seg):
+    words = [w.lower() for w in ALPHA_RE.findall(seg)[:2]]
+    if len(words) > 1 and words[1] in _NOT_IMPERATIVE_NEXT:
+        return False  # "Note is ...", "Test runs can ...": a noun subject
+    return bool(words) and (words[0] in IMPERATIVE_STARTERS
+                            or words[0] in VERB_LEXICON
+                            or words[:2] == ["do", "not"])
+
+
+def check_procedure_form(block, sents, lines):
+    if block.heading or block.text.count("|") >= 2:
+        return []
+    n = sum(1 for (s, e) in sents if _is_instruction(block.text[s:e]))
+    if n < PROCEDURE_MIN:
+        return []
+    if block.list_item:
+        return [V(block, 0, "procedure-form", "warn",
+                  "%d instructions in one step" % n,
+                  "give each instruction its own numbered step",
+                  "list item has %d instructions" % n, lines)]
+    return [V(block, 0, "procedure-form", "warn",
+              "%d instructions in a paragraph" % n,
+              "write the steps as a numbered list, one instruction each",
+              "paragraph has %d instructions" % n, lines)]
+
+
 def check_punctuation(block, sents, lines):
     out = []
     for m in re.finditer("—", block.text):
@@ -984,9 +1119,169 @@ def fact_terms(text):
     return terms
 
 
+# Value words: plain words that stand for a value a machine could store.
+# A color is a hex code, a polarity is a sign, a direction is a value on one
+# axis (side, vertical, depth, rotation, radial, compass),
+# a limit is a comparison operator, a quantity is a number with a unit.
+# Each word maps to (class, canonical value), so "red" and "#ff0000" are the
+# same value and "+" and "positive" are the same value. A rewrite must keep
+# every value of its source; a different value of the same class is a swap.
+_VALUE_CLASSES = {
+    "color": {
+        "#ff0000": "red", "#00ff00": "green", "#0000ff": "blue",
+        "#000000": "black", "#ffffff": "white", "#ffff00": "yellow",
+        "#ffa500": "orange", "#800080": "purple", "#808080": "grey gray",
+        "#a52a2a": "brown", "#ffc0cb": "pink", "#00ffff": "cyan",
+        "#ff00ff": "magenta", "#c0c0c0": "silver", "#ffd700": "gold",
+    },
+    "polarity": {
+        "+": "positive plus anode", "-": "negative minus cathode",
+        "ground": "ground earth gnd",
+    },
+    "side": {"left": "left leftward", "right": "right rightward"},
+    "vertical": {
+        "top": "top upper upward upwards", "bottom": "bottom lower downward "
+        "downwards",
+    },
+    "depth": {
+        "front": "front forward forwards", "rear": "rear backward backwards",
+    },
+    "rotation": {
+        "cw": "clockwise", "ccw": "counterclockwise anticlockwise "
+        "counter-clockwise anti-clockwise",
+    },
+    "radial": {
+        "in": "inward inwards inner inside", "out": "outward outwards outer "
+        "outside",
+    },
+    "compass": {"north": "north", "south": "south", "east": "east",
+                "west": "west"},
+    "state": {
+        "open": "open opened", "closed": "closed shut", "on": "enabled "
+        "energized", "off": "disabled de-energized", "locked": "locked",
+        "unlocked": "unlocked", "true": "true", "false": "false",
+        "required": "required mandatory", "optional": "optional",
+    },
+    "limit": {
+        ">=": "minimum min at-least no-less-than", "<=": "maximum max "
+        "at-most no-more-than up-to", ">": "more-than greater-than above "
+        "exceeds", "<": "less-than fewer-than below",
+    },
+    "order": {
+        "first": "first", "last": "last", "before": "before",
+        "after": "after",
+    },
+}
+_UNIT_ALIASES = {
+    "V": "V volt volts", "mV": "mV millivolt millivolts",
+    "A": "A amp amps ampere amperes", "mA": "mA milliamp milliamps",
+    "W": "W watt watts", "kW": "kW kilowatt kilowatts",
+    "ohm": "ohm ohms Ω", "Hz": "Hz hertz", "kHz": "kHz", "MHz": "MHz",
+    "ms": "ms millisecond milliseconds", "s": "s sec secs second seconds",
+    "min": "min mins minute minutes", "h": "h hr hrs hour hours",
+    "d": "day days", "mm": "mm millimetre millimetres millimeter "
+    "millimeters", "cm": "cm", "m": "m metre metres meter meters",
+    "km": "km", "ft": "ft foot feet", "g": "g gram grams",
+    "kg": "kg kilogram kilograms", "lb": "lb lbs pound pounds",
+    "N": "N newton newtons", "Nm": "Nm N·m newton-metre newton-metres",
+    "psi": "psi", "bar": "bar", "kPa": "kPa", "°C": "°C degC celsius",
+    "°F": "°F degF fahrenheit", "°": "° deg degree degrees",
+    "%": "% percent", "rpm": "rpm", "KB": "KB kB", "MB": "MB", "GB": "GB",
+    "TB": "TB", "USD": "USD dollars", "EUR": "EUR euros",
+    "tokens": "token tokens", "rows": "row rows",
+}
+_VALUE_LOOKUP = {}
+for _cls, _vals in _VALUE_CLASSES.items():
+    for _canon, _words in _vals.items():
+        for _w in _words.split():
+            _VALUE_LOOKUP[_w.replace("-", " ")
+                          if _w.count("-") and _cls == "limit" else _w] = (
+                _cls, _canon)
+_VALUE_WORD_RE = re.compile(
+    r"(?<![\w-])(" + "|".join(
+        re.escape(w).replace(r"\ ", r"\s+")
+        for w in sorted(_VALUE_LOOKUP, key=len, reverse=True)
+        if w not in ("+", "-")) + r")(?![\w-])", re.I)
+_HEX_COLOR_RE = re.compile(r"(?<![\w&])#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b")
+_SIGNED_NUM_RE = re.compile(r"(?:(?<=\s)|^|(?<=\())([+\-−])(?=\d)", re.M)
+_SIGN_WORD_RE = re.compile(r"(?:(?<=\s)|^)([+−]|-(?=\s(?:terminal|pole|lead|"
+                           r"wire|side|post|rail)))(?=\s[A-Za-z])", re.M)
+_CMP_NUM_RE = re.compile(r"(?<![<>=\w])(>=|<=|≥|≤|>|<)\s*(?=[\d~$])")
+_UNIT_LOOKUP = {a: u for u, al in _UNIT_ALIASES.items() for a in al.split()}
+_QTY_RE = re.compile(
+    r"(?<![\w.])(\d+(?:[.,]\d+)*)\s?(" + "|".join(
+        re.escape(a) for a in sorted(_UNIT_LOOKUP, key=len, reverse=True))
+    + r")(?![\w])")
+_PHRASAL_RE = re.compile(r"\b(?:" + "|".join(
+    re.escape(p) for p in DENY_PHRASAL) + r")\b", re.I)
+
+
+def _hex6(h):
+    h = h.lower()
+    return "#" + ("".join(c * 2 for c in h) if len(h) == 3 else h)
+
+
+def value_terms(text):
+    """Value words of a text -> {(class, canonical): (first line, as written)}.
+
+    Phrasal verbs are blanked first: "set up" is an action, not a direction.
+    Words of one or two letters ("in", "on", "s") count only as units after
+    a number, never alone.
+    """
+    vals = {}
+    for n, line in enumerate(text.splitlines(), 1):
+        line = _PHRASAL_RE.sub(lambda m: " " * len(m.group(0)), line)
+        found = []
+        for m in _VALUE_WORD_RE.finditer(line):
+            w = re.sub(r"\s+", " ", m.group(1))
+            key = _VALUE_LOOKUP.get(w) or _VALUE_LOOKUP.get(w.lower())
+            if key is None:
+                continue
+            if w in _UNIT_LOOKUP and re.search(r"\d\s?$", line[:m.start()]):
+                continue
+            found.append((key, w))
+        for m in _HEX_COLOR_RE.finditer(line):
+            found.append((("color", _hex6(m.group(1))), m.group(0)))
+        for m in _SIGNED_NUM_RE.finditer(line):
+            found.append((("polarity", "+" if m.group(1) == "+" else "-"),
+                          m.group(1)))
+        for m in _SIGN_WORD_RE.finditer(line):
+            found.append((("polarity", "+" if m.group(1) == "+" else "-"),
+                          m.group(1)))
+        for m in _CMP_NUM_RE.finditer(line):
+            op = {"≥": ">=", "≤": "<="}.get(m.group(1), m.group(1))
+            found.append((("limit", op), m.group(1)))
+        for m in _QTY_RE.finditer(line):
+            num = m.group(1).replace(",", ".")
+            unit = _UNIT_LOOKUP[m.group(2)]
+            found.append((("quantity", "%s %s" % (num, unit)), m.group(0)))
+        for key, written in found:
+            vals.setdefault(key, (n, written))
+    return vals
+
+
 def check_fact_coverage(source_text, text, min_ratio):
     """Violations for facts the rewrite dropped, plus a coverage summary."""
     out = []
+    src_vals = value_terms(source_text)
+    out_vals = value_terms(text)
+    missing_values = []
+    for (cls, canon), (n, written) in src_vals.items():
+        if (cls, canon) in out_vals:
+            continue
+        missing_values.append("%s (%s)" % (written, cls))
+        swaps = [w for (c2, v2), (_, w) in out_vals.items()
+                 if c2 == cls and (c2, v2) not in src_vals
+                 and (cls != "quantity" or v2.split()[1] == canon.split()[1]
+                      or v2.split()[0] == canon.split()[0])]
+        msg = ("the source says '%s' (%s) and the rewrite does not"
+               % (written, cls))
+        if swaps:
+            msg += "; the rewrite has '%s' instead" % "', '".join(swaps)
+        out.append({"line": 0, "col": 0, "category": "fact-coverage",
+                    "severity": "error", "found": written,
+                    "replace": "keep the %s from source line %d" % (cls, n),
+                    "message": msg, "text": ""})
     terms = fact_terms(source_text)
     missing = []
     for term, n in terms.items():
@@ -1019,6 +1314,7 @@ def check_fact_coverage(source_text, text, min_ratio):
                     "message": "the rewrite has %d words, the source %d"
                                % (out_words, src_words), "text": ""})
     summary = {"terms": len(terms), "missing": missing,
+               "values": len(src_vals), "missing_values": missing_values,
                "negations_source": neg_src, "negations_rewrite": neg_out,
                "words_source": src_words, "words_rewrite": out_words,
                "length_ratio": round(ratio, 2)}
@@ -1232,6 +1528,10 @@ def main(argv=None):
         violations += check_deny_list(b, gspans, src_lines)
         violations += check_passive(b, src_lines)
         violations += check_multi_action(b, sents, src_lines)
+        violations += check_telegraphic(b, sents, src_lines)
+        violations += check_warning_label(b, sents, src_lines)
+        violations += check_paragraph_length(b, sents, src_lines)
+        violations += check_procedure_form(b, sents, src_lines)
         if ext.lower() in SOURCE_EXTS:
             violations += check_history(b, src_lines)
         pv = check_punctuation(b, sents, src_lines)
