@@ -25,6 +25,9 @@ ste-lint FILE --lang py                # force language (for stdin or odd extens
 ste-lint FILE --glossary terms.txt     # whitelist project-specific jargon
 ste-lint FILE --skill                  # skill-arg check (automatic for SKILL.md)
 ste-lint NEW --source OLD              # fact-coverage: fail if the rewrite lost a fact
+ste-lint NEW --source LOG --facts code,ident  # a summary kept every identifier
+ste-lint FILE --diff                   # only lines changed since HEAD
+ste-lint FILE --lines 3-10,15          # only these lines
 ste-lint -                             # read from stdin
 ```
 

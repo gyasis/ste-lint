@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 
 CATEGORIES = ("sentence-length", "deny-list", "passive-voice",
@@ -1107,15 +1108,24 @@ _NEGATION_RE = re.compile(r"\b(?:not|never|no|none|cannot|don't|doesn't|"
                           r"isn't|aren't|won't|can't|mustn't)\b", re.I)
 
 
-def fact_terms(text):
+FACT_KINDS = ("code", "ident", "number", "negation", "value")
+# Log levels and safety labels are ALL-CAPS but carry no fact of their own.
+_FACT_SKIP = {"", "INFO", "WARN", "WARNING", "ERROR", "DEBUG", "TRACE",
+              "FATAL", "CRITICAL", "NOTE", "CAUTION", "DANGER"}
+
+
+def fact_terms(text, kinds=FACT_KINDS):
     """Key terms of a text -> {term: first line number (1-based)}."""
+    rxs = [rx for k, rx in (("code", _FACT_CODE_RE), ("number", _FACT_NUM_RE),
+                            ("ident", _FACT_IDENT_RE)) if k in kinds]
     terms = {}
     for n, line in enumerate(text.splitlines(), 1):
-        for rx in (_FACT_CODE_RE, _FACT_NUM_RE, _FACT_IDENT_RE):
+        for rx in rxs:
             for m in rx.finditer(line):
                 term = (m.group(1) if rx is _FACT_CODE_RE else m.group(0))
                 terms.setdefault(term.strip(), n)
-    terms.pop("", None)
+    for t in _FACT_SKIP:
+        terms.pop(t, None)
     return terms
 
 
@@ -1260,11 +1270,15 @@ def value_terms(text):
     return vals
 
 
-def check_fact_coverage(source_text, text, min_ratio):
-    """Violations for facts the rewrite dropped, plus a coverage summary."""
+def check_fact_coverage(source_text, text, min_ratio, kinds=FACT_KINDS):
+    """Violations for facts the rewrite dropped, plus a coverage summary.
+
+    kinds limits the fact types: a summary of a long log keeps its error
+    codes and paths ("code,ident") but not every number in it.
+    """
     out = []
-    src_vals = value_terms(source_text)
-    out_vals = value_terms(text)
+    src_vals = value_terms(source_text) if "value" in kinds else {}
+    out_vals = value_terms(text) if "value" in kinds else {}
     missing_values = []
     for (cls, canon), (n, written) in src_vals.items():
         if (cls, canon) in out_vals:
@@ -1282,7 +1296,7 @@ def check_fact_coverage(source_text, text, min_ratio):
                     "severity": "error", "found": written,
                     "replace": "keep the %s from source line %d" % (cls, n),
                     "message": msg, "text": ""})
-    terms = fact_terms(source_text)
+    terms = fact_terms(source_text, kinds)
     missing = []
     for term, n in terms.items():
         rx = re.compile(r"(?<![\w])" + re.escape(term) + r"(?![\w])")
@@ -1295,7 +1309,7 @@ def check_fact_coverage(source_text, text, min_ratio):
                                    "rewrite" % term, "text": ""})
     neg_src = len(_NEGATION_RE.findall(source_text))
     neg_out = len(_NEGATION_RE.findall(text))
-    if neg_out < neg_src:
+    if "negation" in kinds and neg_out < neg_src:
         out.append({"line": 0, "col": 0, "category": "fact-coverage",
                     "severity": "error",
                     "found": "%d of %d negations" % (neg_out, neg_src),
@@ -1357,6 +1371,63 @@ def check_synonym_rotation(blocks, section_of_line, glossary_pats, lines):
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
+def parse_line_spec(spec):
+    """'3-10,15' -> {3, ..., 10, 15} (1-based line numbers)."""
+    out = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        a, _, b = part.partition("-")
+        lo, hi = int(a), int(b or a)
+        out.update(range(lo, hi + 1))
+    return out
+
+
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.M)
+
+
+def git_changed_lines(path, ref):
+    """Lines of path added or changed since ref -> (set or None, error).
+
+    None means every line: the file is new to git. The error string names
+    the reason when git cannot answer.
+    """
+    d = os.path.dirname(os.path.abspath(path))
+    name = os.path.basename(path)
+    tracked = subprocess.run(["git", "-C", d, "ls-files", "--error-unmatch",
+                              name], capture_output=True, text=True)
+    if tracked.returncode != 0:
+        if "not a git repository" in tracked.stderr:
+            return set(), "%s is not in a git repository; use --lines" % path
+        return None, ""
+    r = subprocess.run(["git", "-C", d, "diff", "-U0", ref, "--", name],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return set(), "git diff %s failed: %s" % (ref, r.stderr.strip())
+    lines = set()
+    for m in _HUNK_RE.finditer(r.stdout):
+        start, count = int(m.group(1)), int(m.group(2) or 1)
+        lines.update(range(start, start + count))
+    return lines, ""
+
+
+def density_stats(blocks, verbs, words):
+    """Information density of the prose: informational, never a gate.
+
+    density = (verbs + fact terms + value words) / words. Filler lowers it,
+    numbers, identifiers and actions raise it.
+    """
+    text = "\n".join(b.text for b in blocks)
+    facts = len(fact_terms(text))
+    values = len(value_terms(text))
+    sents = sum(len(split_sentences(b.text)) for b in blocks)
+    return {"facts": facts, "values": values,
+            "words_per_sentence": round(words / sents, 1) if sents else 0.0,
+            "density": round((verbs + facts + values) / words, 3)
+            if words else 0.0}
+
+
 def human_report(args, path_label, violations, counts, stats, punct_detail,
                  gate_result):
     lines = []
@@ -1377,6 +1448,13 @@ def human_report(args, path_label, violations, counts, stats, punct_detail,
                  % (_fmt_score(stats["per_verbs"]), stats["per_words"]))
     lines.append("  " + " | ".join("%s %d" % (c, counts[c])
                                    for c in CATEGORIES))
+    dn = stats["density"]
+    lines.append("  density %.3f (verbs + %d facts + %d values per word, "
+                 "informational) | %.1f words per sentence"
+                 % (dn["density"], dn["facts"], dn["values"],
+                    dn["words_per_sentence"]))
+    if stats.get("changed") is not None:
+        lines.append("  scope: %d changed line(s) only" % stats["changed"])
     if counts["punctuation"]:
         lines.append("  punctuation (advisory, not scored): %d em dashes, "
                      "%d semicolons, %d comma-heavy sentences"
@@ -1427,6 +1505,15 @@ def main(argv=None):
     ap.add_argument("--min-ratio", type=float, default=None, metavar="R",
                     help="with --source: fail if the rewrite has fewer than "
                          "R x the source's words (e.g. 0.6)")
+    ap.add_argument("--facts", metavar="KINDS",
+                    help="with --source: fact kinds to check, comma-separated "
+                         "from %s (default all). For a summary of a log use "
+                         "'code,ident'." % ",".join(FACT_KINDS))
+    ap.add_argument("--diff", nargs="?", const="HEAD", metavar="REF",
+                    help="report only lines added or changed since the git "
+                         "ref (default HEAD); a file new to git counts whole")
+    ap.add_argument("--lines", metavar="SPEC",
+                    help="report only these 1-based lines, e.g. '3-10,15'")
     ap.add_argument("--lang", metavar="EXT",
                     help="force source language (e.g. py ts sql sh); "
                          "auto-detected from filename otherwise. "
@@ -1479,6 +1566,39 @@ def main(argv=None):
     elif args.min_ratio is not None:
         sys.stderr.write("ste-lint: --min-ratio needs --source.\n")
         return 2
+    fact_kinds = FACT_KINDS
+    if args.facts:
+        if source_text is None:
+            sys.stderr.write("ste-lint: --facts needs --source.\n")
+            return 2
+        fact_kinds = tuple(k.strip() for k in args.facts.split(",")
+                           if k.strip())
+        bad = set(fact_kinds) - set(FACT_KINDS)
+        if bad:
+            sys.stderr.write("ste-lint: unknown fact kind %s. Valid: %s\n"
+                             % (", ".join(sorted(bad)), ",".join(FACT_KINDS)))
+            return 2
+
+    changed = None  # None = every line
+    if args.diff and args.lines:
+        sys.stderr.write("ste-lint: use --diff or --lines, not both.\n")
+        return 2
+    if args.lines:
+        try:
+            changed = parse_line_spec(args.lines)
+        except ValueError:
+            sys.stderr.write("ste-lint: --lines takes '3-10,15', got %r.\n"
+                             % args.lines)
+            return 2
+    elif args.diff:
+        if args.file == "-":
+            sys.stderr.write("ste-lint: --diff needs a file; use --lines "
+                             "for stdin.\n")
+            return 2
+        changed, err = git_changed_lines(args.file, args.diff)
+        if err:
+            sys.stderr.write("ste-lint: %s.\n" % err)
+            return 2
 
     src_lines = text.splitlines()
 
@@ -1500,6 +1620,11 @@ def main(argv=None):
 
     masked, meta = mask_markdown(analysis_lines, source=ext.lower() in SOURCE_EXTS)
     blocks = build_blocks(masked, meta)
+    if changed is not None:
+        # A block (paragraph) with any changed line is checked whole, so a
+        # sentence that starts above the change is still read in full.
+        blocks = [b for b in blocks
+                  if any(ln + 1 in changed for ln, _ in b.cmap)]
 
     # Section map for synonym rotation: markdown headings delimit sections;
     # if the doc has no headings at all, fall back to 20-line windows.
@@ -1550,9 +1675,16 @@ def main(argv=None):
         violations += check_skill_args(src_lines)
     coverage = None
     if source_text is not None:
-        cv, coverage = check_fact_coverage(source_text, text, args.min_ratio)
+        cv, coverage = check_fact_coverage(source_text, text, args.min_ratio,
+                                           fact_kinds)
         violations += cv
 
+    if changed is not None:
+        # synonym-rotation and skill-arg look at the whole file: keep their
+        # hits on changed lines. Line 0 is a whole-file fact-coverage hit.
+        block_lines = {ln + 1 for b in blocks for ln, _ in b.cmap}
+        violations = [v for v in violations if v["line"] == 0
+                      or v["line"] in block_lines or v["line"] in changed]
     if args.only_set:
         violations = [v for v in violations if v["category"] in args.only_set]
 
@@ -1586,7 +1718,9 @@ def main(argv=None):
         per_verbs = 0.0                   # genuinely nothing flagged
     per_words = (scored * 100.0 / total_words) if total_words else 0.0
     stats = {"words": total_words, "sentences": total_sentences,
-             "verbs": verbs, "per_verbs": per_verbs, "per_words": per_words}
+             "verbs": verbs, "per_verbs": per_verbs, "per_words": per_words,
+             "density": density_stats(blocks, verbs, total_words),
+             "changed": None if changed is None else len(changed)}
 
     gate_result = None
     ok = True
@@ -1612,6 +1746,8 @@ def main(argv=None):
             "verbs": verbs, "words": total_words,
             "sentences": total_sentences,
             "counts": counts,
+            "density": stats["density"],
+            "changed_lines": stats["changed"],
             "violations": violations,
         }
         if coverage is not None:

@@ -70,6 +70,30 @@ checked, so a human still reads the rewrite.
 ste-lint rewrite.md --source original.md --min-ratio 0.6
 ```
 
+### Summaries of logs and other files
+
+A summary of a long log must keep the error names, paths and flags, but not
+every number in the log. `--facts` limits the check to some fact kinds:
+`code`, `ident`, `number`, `negation` and `value`.
+
+```bash
+ste-lint handoff.md --source raw.log --facts code,ident
+```
+
+Log levels and safety labels (`INFO`, `ERROR`, `WARNING`, `NOTE`) are not
+facts.
+
+## Changed lines only
+
+`--diff [REF]` reports only the paragraphs with a line added or changed since
+the git ref (default `HEAD`). A file that git does not track counts whole.
+`--lines 3-10,15` does the same for a given line range, also on stdin. Use
+either option to gate new text without first fixing every old line.
+
+```bash
+ste-lint README.md --diff --max-score 2.0
+```
+
 ## Install
 
 ```bash
@@ -87,6 +111,9 @@ ste-lint FILE --lang py           # force language (stdin or non-standard ext)
 ste-lint FILE --glossary proj.txt # whitelist project-specific jargon
 ste-lint - --skill < SKILL.md     # skill-arg check on stdin
 ste-lint NEW --source OLD         # fail if the rewrite lost a fact
+ste-lint NEW --source LOG --facts code,ident  # summary kept the identifiers
+ste-lint FILE --diff              # only lines changed since HEAD
+ste-lint FILE --lines 3-10,15     # only these lines
 ste-lint -                        # read from stdin
 ```
 
@@ -94,6 +121,11 @@ ste-lint -                        # read from stdin
 
 Violations per 100 verbs. Published ASD-STE100 research: baseline prose ~4.36,
 STE-compliant prose ~1.12. Target < 2.0 for technical documentation.
+
+The report also shows a density figure:
+(verbs + fact terms + value words) / words, and the mean words per sentence.
+Filler lowers the density. Numbers, identifiers and actions raise it. The
+density is for comparison and for debugging, never a gate.
 
 ## Supported file types
 
